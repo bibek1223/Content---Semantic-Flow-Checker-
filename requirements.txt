@@ -1,6 +1,5 @@
-streamlit
+torch>=2.5.0
 sentence-transformers
+streamlit
 scikit-learn
 pandas
-torch==2.0.1
-huggingface_hub[hf_xet]
