@@ -3,3 +3,5 @@ sentence-transformers
 streamlit
 scikit-learn
 pandas
+spacy==3.5.4
+en-core-web-sm==3.5.0
