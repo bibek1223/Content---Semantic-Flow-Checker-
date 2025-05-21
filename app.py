@@ -2,6 +2,7 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import re
+import pandas as pd
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -65,30 +66,46 @@ def assign_content_to_headings_multiple_levels(headings, content, levels=[1,2]):
             assigned_all.append({'heading': heading, 'paragraphs': chunk, 'level': level})
     return assigned_all
 
+def sims_to_df(sims, level, flow_type):
+    rows = []
+    for i, (a, b, score, comment) in enumerate(sims):
+        # Trim paragraph text to 150 chars for readability
+        a_display = a if len(a) <= 150 else a[:147] + '...'
+        b_display = b if len(b) <= 150 else b[:147] + '...'
+        rows.append({
+            'Item 1': a_display,
+            'Item 2': b_display,
+            'Score': round(score, 3),
+            'Remark': comment,
+            'Level': f"H{level}",
+            'Flow Type': flow_type
+        })
+    return pd.DataFrame(rows)
+
 def analyze_assigned_content_by_level(assigned):
-    output_lines = []
+    all_dfs = []
     for level in sorted(set(item['level'] for item in assigned)):
         items = [item for item in assigned if item['level'] == level]
         titles = [item['heading']['title'] for item in items]
+
+        # Section-to-section flow
         if len(titles) > 1:
             sims = check_similarity(titles, 'section')
-            output_lines.append(f"=== Section-to-Section Flow (H{level}) ===")
-            for i, (a, b, score, comment) in enumerate(sims):
-                output_lines.append(f"Between '{a}' and '{b}': {comment} (score: {score:.3f})")
-            output_lines.append("")
-        output_lines.append(f"=== Paragraph-to-Paragraph Flow (H{level}) ===")
+            df_section = sims_to_df(sims, level, 'Section-to-Section')
+            all_dfs.append(df_section)
+
+        # Paragraph-to-paragraph flow
         for item in items:
-            heading = item['heading']
             paras = item['paragraphs']
-            output_lines.append(f"Under {heading['title']}:")
             if len(paras) < 2:
-                output_lines.append("  Not enough paragraphs for analysis.")
                 continue
             sims = check_similarity(paras, 'paragraph')
-            for i, (a, b, score, comment) in enumerate(sims):
-                output_lines.append(f"  Paragraph {i+1} to {i+2}: {comment} (score: {score:.3f})")
-            output_lines.append("")
-    return '\n'.join(output_lines)
+            df_para = sims_to_df(sims, level, f"Paragraph-to-Paragraph under '{item['heading']['title']}'")
+            all_dfs.append(df_para)
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    else:
+        return pd.DataFrame(columns=['Item 1', 'Item 2', 'Score', 'Remark', 'Level', 'Flow Type'])
 
 def define_context(paragraphs):
     embeddings = model.encode(paragraphs)
@@ -97,7 +114,7 @@ def define_context(paragraphs):
     context = []
     for i, sim_row in enumerate(similarities):
         avg_similarity = sum(sim_row) / len(sim_row)
-        if avg_similarity < 0.5:  # Threshold for out-of-context
+        if avg_similarity < 0.5:
             context.append((paragraphs[i], "Out of context. Consider adding more details."))
         else:
             context.append((paragraphs[i], "Well-aligned with main context."))
@@ -112,7 +129,6 @@ def generate_improvement_suggestions(paragraphs, context):
             suggestions.append(f"Paragraph {i+1} is aligned with the main context.")
     return suggestions
 
-# Streamlit UI
 st.title("Semantic Flow Analysis with Context and Suggestions")
 
 headings_text = st.text_area(
@@ -145,14 +161,17 @@ if st.button("Analyze Semantic Flow"):
     else:
         headings = parse_headings(headings_text)
         assigned_content = assign_content_to_headings_multiple_levels(headings, content_text, levels=[1,2])
-        flow_result = analyze_assigned_content_by_level(assigned_content)
+        flow_df = analyze_assigned_content_by_level(assigned_content)
 
         paragraphs = split_into_paragraphs(content_text)
         context = define_context(paragraphs)
         suggestions = generate_improvement_suggestions(paragraphs, context)
 
         st.subheader("Semantic Flow Analysis")
-        st.text(flow_result)
+        if flow_df.empty:
+            st.write("No flow data to display.")
+        else:
+            st.dataframe(flow_df[['Level', 'Flow Type', 'Item 1', 'Item 2', 'Score', 'Remark']])
 
         st.subheader("Improvement Suggestions")
         for s in suggestions:
