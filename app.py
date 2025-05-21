@@ -1,15 +1,11 @@
-import asyncio
-
-try:
-    asyncio.get_running_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+import spacy
 import re
-import pandas as pd
+
+# Load spaCy small English model (make sure to install: python -m spacy download en_core_web_sm)
+nlp = spacy.load("en_core_web_sm")
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -51,135 +47,133 @@ def parse_headings(headings_text):
             headings.append({'level': level, 'title': title})
     return headings
 
-def assign_content_to_headings_multiple_levels(headings, content, levels=[1,2]):
+def assign_content_to_headings(headings, content, top_level=2):
+    top_headings = [h for h in headings if h['level'] == top_level]
     paragraphs = split_into_paragraphs(content)
-    assigned_all = []
+    assigned = []
+    n = len(paragraphs)
+    m = len(top_headings)
+    if m == 0:
+        # fallback: assign all paragraphs under a dummy heading
+        assigned.append({'heading': {'level': top_level, 'title': 'Content'}, 'paragraphs': paragraphs})
+        return assigned
+    approx_chunk_size = max(1, n // m)
+    idx = 0
+    for i, heading in enumerate(top_headings):
+        if i < m -1:
+            chunk = paragraphs[idx: idx + approx_chunk_size]
+            idx += approx_chunk_size
+        else:
+            chunk = paragraphs[idx:]
+        assigned.append({'heading': heading, 'paragraphs': chunk})
+    return assigned
 
-    for level in levels:
-        top_headings = [h for h in headings if h['level'] == level]
-        n = len(paragraphs)
-        m = len(top_headings)
-        if m == 0:
+def analyze_assigned_content(assigned):
+    output_lines = []
+    titles = [item['heading']['title'] for item in assigned]
+    if len(titles) > 1:
+        sims = check_similarity(titles, 'section')
+        output_lines.append("=== Section-to-Section Flow ===")
+        for a, b, score, comment in sims:
+            output_lines.append(f"Between '{a}' and '{b}': {comment} (score: {score:.3f})")
+        output_lines.append("")
+    output_lines.append("=== Paragraph-to-Paragraph Flow ===")
+    for item in assigned:
+        heading = item['heading']
+        paras = item['paragraphs']
+        output_lines.append(f"Under {heading['title']}:")
+        if len(paras) < 2:
+            output_lines.append("  Not enough paragraphs for analysis.")
             continue
-        approx_chunk_size = max(1, n // m)
+        sims = check_similarity(paras, 'paragraph')
+        for i, (a, b, score, comment) in enumerate(sims):
+            output_lines.append(f"  Paragraph {i+1} to {i+2}: {comment} (score: {score:.3f})")
+        output_lines.append("")
+    return '\n'.join(output_lines)
 
-        idx = 0
-        for i, heading in enumerate(top_headings):
-            if i < m - 1:
-                chunk = paragraphs[idx: idx + approx_chunk_size]
-                idx += approx_chunk_size
-            else:
-                chunk = paragraphs[idx:]
-            assigned_all.append({'heading': heading, 'paragraphs': chunk, 'level': level})
-    return assigned_all
+# --- New functions for context and suggestions ---
 
-def sims_to_df(sims, level, flow_type):
-    rows = []
-    for i, (a, b, score, comment) in enumerate(sims):
-        # Trim paragraph text to 150 chars for readability
-        a_display = a if len(a) <= 150 else a[:147] + '...'
-        b_display = b if len(b) <= 150 else b[:147] + '...'
-        rows.append({
-            'Item 1': a_display,
-            'Item 2': b_display,
-            'Score': round(score, 3),
-            'Remark': comment,
-            'Level': f"H{level}",
-            'Flow Type': flow_type
-        })
-    return pd.DataFrame(rows)
+def extract_key_concepts(text):
+    doc = nlp(text)
+    keywords = set()
+    for chunk in doc.noun_chunks:
+        # Filter short chunks
+        if len(chunk.text.strip()) > 2:
+            keywords.add(chunk.text.lower())
+    return list(keywords)
 
-def analyze_assigned_content_by_level(assigned):
-    all_dfs = []
-    for level in sorted(set(item['level'] for item in assigned)):
-        items = [item for item in assigned if item['level'] == level]
-        titles = [item['heading']['title'] for item in items]
+def paragraph_concept_coverage(paragraph, context_keywords):
+    para_doc = nlp(paragraph.lower())
+    para_text = para_doc.text
+    missing_concepts = []
+    for concept in context_keywords:
+        # simple substring check, can be improved to fuzzy matching
+        if concept not in para_text:
+            missing_concepts.append(concept)
+    return missing_concepts
 
-        # Section-to-section flow
-        if len(titles) > 1:
-            sims = check_similarity(titles, 'section')
-            df_section = sims_to_df(sims, level, 'Section-to-Section')
-            all_dfs.append(df_section)
-
-        # Paragraph-to-paragraph flow
-        for item in items:
-            paras = item['paragraphs']
-            if len(paras) < 2:
-                continue
-            sims = check_similarity(paras, 'paragraph')
-            df_para = sims_to_df(sims, level, f"Paragraph-to-Paragraph under '{item['heading']['title']}'")
-            all_dfs.append(df_para)
-    if all_dfs:
-        return pd.concat(all_dfs, ignore_index=True)
-    else:
-        return pd.DataFrame(columns=['Item 1', 'Item 2', 'Score', 'Remark', 'Level', 'Flow Type'])
-
-def define_context(paragraphs):
-    embeddings = model.encode(paragraphs)
-    similarities = cosine_similarity(embeddings)
-
-    context = []
-    for i, sim_row in enumerate(similarities):
-        avg_similarity = sum(sim_row) / len(sim_row)
-        if avg_similarity < 0.5:
-            context.append((paragraphs[i], "Out of context. Consider adding more details."))
-        else:
-            context.append((paragraphs[i], "Well-aligned with main context."))
-    return context
-
-def generate_improvement_suggestions(paragraphs, context):
+def generate_specific_suggestions(paragraphs, context_text):
+    context_keywords = extract_key_concepts(context_text)
     suggestions = []
-    for i, (para, stat) in enumerate(context):
-        if stat == "Out of context. Consider adding more details.":
-            suggestions.append(f"Paragraph {i+1} is out of context. Suggest adding a bridging sentence or more background information.")
+    for idx, para in enumerate(paragraphs):
+        missing = paragraph_concept_coverage(para, context_keywords)
+        if missing:
+            missing_preview = ', '.join(missing[:5])  # limit to 5 concepts
+            suggestion = (
+                f"Paragraph {idx+1} misses key concepts: {missing_preview}. "
+                "Consider adding explanations, examples, or clarifications about these topics."
+            )
         else:
-            suggestions.append(f"Paragraph {i+1} is aligned with the main context.")
+            suggestion = f"Paragraph {idx+1} covers main concepts well."
+        suggestions.append((idx, para, suggestion))
     return suggestions
 
-st.title("Semantic Flow Analysis with Context and Suggestions")
+# --- Streamlit UI ---
 
-headings_text = st.text_area(
-    "Headings (Use <H1>, <H2>, <H3> tags)",
-    '''<H1> What is an IT Service Provider? Types, Importance, and Requirements
+st.title("Semantic Flow Checker with Context-Aware Suggestions")
+
+headings_input = st.text_area(
+    "Paste Headings (with <H1>, <H2>, <H3> tags, one per line):",
+    height=200,
+    value='''<H1> What is an IT Service Provider? Types, Importance, and Requirements
 <H2> What Service Does IT Service Provider Offer?
 <H2> What Does the IT Service Provider Do?
 <H2> Types of IT Service Provider
-<H3> 1. Consultation and Strategy
-<H3> 2. Internet Service Provider (ISP)
-<H3> 3. Cloud Service Provider
-<H3> 4. Network and Cloud Security Service Provider
-<H3> 5. Digital Adoption Service Provider
-<H3> 6. SaaS Service Provider
-<H3> 7. Hosting Service Provider
 <H2> Why Do Companies Require IT Service Providers?
-<H2> How to Choose the Right IT Service Provider?''',
-    height=200
+<H2> How to Choose the Right IT Service Provider?'''
 )
 
-content_text = st.text_area(
-    "Content (without headings)",
-    "Paste full content here...",
-    height=300
+context_input = st.text_area(
+    "Enter Main Context / Summary (brief text defining the topic):",
+    height=100,
+    value="IT service providers offer technology services that help businesses manage IT infrastructure, cybersecurity, cloud solutions, and consulting."
 )
 
-if st.button("Analyze Semantic Flow"):
-    if not headings_text.strip() or not content_text.strip():
-        st.warning("Please enter both headings and content.")
+content_input = st.text_area(
+    "Paste full content text here (without headings):",
+    height=300,
+    value="Paste your content paragraphs here separated by blank lines..."
+)
+
+if st.button("Analyze Semantic Flow and Context Alignment"):
+
+    if not headings_input.strip() or not content_input.strip() or not context_input.strip():
+        st.error("Please provide Headings, Content, and Context text.")
     else:
-        headings = parse_headings(headings_text)
-        assigned_content = assign_content_to_headings_multiple_levels(headings, content_text, levels=[1,2])
-        flow_df = analyze_assigned_content_by_level(assigned_content)
+        headings = parse_headings(headings_input)
+        assigned_content = assign_content_to_headings(headings, content_input)
 
-        paragraphs = split_into_paragraphs(content_text)
-        context = define_context(paragraphs)
-        suggestions = generate_improvement_suggestions(paragraphs, context)
-
+        # Show semantic flow results
+        flow_report = analyze_assigned_content(assigned_content)
         st.subheader("Semantic Flow Analysis")
-        if flow_df.empty:
-            st.write("No flow data to display.")
-        else:
-            st.dataframe(flow_df[['Level', 'Flow Type', 'Item 1', 'Item 2', 'Score', 'Remark']])
+        st.text(flow_report)
 
-        st.subheader("Improvement Suggestions")
-        for s in suggestions:
-            st.write(f"- {s}")
+        # Context-aware suggestions
+        st.subheader("Context-Aware Paragraph Suggestions")
+        paragraphs = split_into_paragraphs(content_input)
+        suggestions = generate_specific_suggestions(paragraphs, context_input)
+        for idx, para, suggestion in suggestions:
+            preview = para if len(para) < 200 else para[:197] + "..."
+            st.markdown(f"**Paragraph {idx+1}:** {preview}")
+            st.markdown(f"- Suggestion: {suggestion}")
+            st.markdown("---")
