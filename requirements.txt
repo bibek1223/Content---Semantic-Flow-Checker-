@@ -1,3 +1,6 @@
 streamlit
 sentence-transformers
 scikit-learn
+pandas
+torch==2.0.1
+huggingface_hub[hf_xet]
